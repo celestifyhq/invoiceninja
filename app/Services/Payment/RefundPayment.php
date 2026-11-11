@@ -33,10 +33,6 @@ class RefundPayment
 
     private float $credits_used = 0;
 
-    private bool $refund_failed = false;
-
-    private string $refund_failed_message = '';
-
     private string $mutation_key = '';
 
     /** @var array<int, array<string, mixed>> */
@@ -49,10 +45,13 @@ class RefundPayment
         $this->mutation_key = (string) ($this->refund_data['tax_mutation_key'] ?? Str::uuid());
         $this->refund_data['tax_mutation_key'] = $this->mutation_key;
 
+        // The gateway refund runs before anything is written, so a failed
+        // gateway refund (PaymentRefundFailed) leaves no local changes behind.
         $this->payment = $this
                             ->calculateTotalRefund() //sets amount for the refund (needed if we are refunding multiple invoices in one payment)
-                            ->updateCreditables() //return the credits first
+                            ->calculateCreditsUsed() //portion of the refund returned as credit rather than through the gateway
                             ->processGatewayRefund() //process the gateway refund if needed
+                            ->updateCreditables() //return the credits
                             ->setStatus() //sets status of payment
                             ->updatePaymentables() //update the paymentable items
                             ->adjustInvoices()
@@ -78,22 +77,12 @@ class RefundPayment
                 });
         }
 
-        $is_gateway_refund = ($this->refund_data['gateway_refund'] !== false || $this->refund_failed || (isset($this->refund_data['via_webhook']) && $this->refund_data['via_webhook'] !== false)) ? ctrans('texts.yes') : ctrans('texts.no');
+        $is_gateway_refund = ($this->refund_data['gateway_refund'] !== false || (isset($this->refund_data['via_webhook']) && $this->refund_data['via_webhook'] !== false)) ? ctrans('texts.yes') : ctrans('texts.no');
         $notes = ctrans('texts.refunded') . " : {$this->total_refund} - " . ctrans('texts.gateway_refund') . " : " . $is_gateway_refund;
 
         $this->createActivity($notes);
-        $this->finalize();
 
         return $this->payment;
-    }
-
-    private function finalize(): self
-    {
-        if ($this->refund_failed) {
-            throw new PaymentRefundFailed($this->refund_failed_message);
-        }
-
-        return $this;
     }
 
     /**
@@ -121,6 +110,10 @@ class RefundPayment
             if ($this->payment->company_gateway) {
                 $response = $this->payment->company_gateway->driver($this->payment->client)->refund($this->payment, $net_refund);
 
+                if ($response['success'] == false) {
+                    throw new PaymentRefundFailed($response['description'] ?? '');
+                }
+
                 if ($response['amount'] ?? false) {
                     $net_refund = $response['amount'];
                 }
@@ -138,12 +131,6 @@ class RefundPayment
                 }
 
                 $this->payment->refunded += $net_refund;
-
-                if ($response['success'] == false) {
-                    $this->payment->save();
-                    $this->refund_failed = true;
-                    $this->refund_failed_message = $response['description'] ?? '';
-                }
             } else {
                 $this->payment->refunded += $net_refund;
             }
@@ -294,6 +281,33 @@ class RefundPayment
     }
 
     /**
+     * Work out how much of the refund is returned to the
+     * credits bundled in this payment, without writing anything.
+     *
+     * Mirrors the allocation in updateCreditables().
+     *
+     * @return $this
+     */
+    private function calculateCreditsUsed()
+    {
+        $amount_to_refund = $this->total_refund;
+
+        foreach ($this->payment->credits as $paymentable_credit) {
+            $available_credit = $paymentable_credit->pivot->amount - $paymentable_credit->pivot->refunded;
+            $credit_refund = $available_credit > $amount_to_refund ? $amount_to_refund : $available_credit;
+
+            $this->credits_used += $credit_refund;
+            $amount_to_refund -= $credit_refund;
+
+            if ($amount_to_refund == 0) {
+                break;
+            }
+        }
+
+        return $this;
+    }
+
+    /**
      * If credits have been bundled in this payment, we
      * need to reverse these.
      *
@@ -330,7 +344,6 @@ class RefundPayment
                             ->save();
                     }
 
-                    $this->credits_used += $amount_to_refund;
                     $amount_to_refund = 0;
 
                 } else {
@@ -353,7 +366,6 @@ class RefundPayment
                             ->save();
                     }
 
-                    $this->credits_used += $available_credit;
                     $amount_to_refund -= $available_credit;
 
                 }
