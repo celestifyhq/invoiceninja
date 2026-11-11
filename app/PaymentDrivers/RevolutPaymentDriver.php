@@ -22,6 +22,7 @@ use App\Models\Payment;
 use App\Models\PaymentHash;
 use App\Models\PaymentType;
 use App\Models\SystemLog;
+use App\PaymentDrivers\Revolut\CreditCard;
 use App\PaymentDrivers\Revolut\Hosted;
 use App\PaymentDrivers\Revolut\MerchantApi;
 use App\Utils\Traits\MakesHash;
@@ -61,15 +62,27 @@ class RevolutPaymentDriver extends BaseDriver
     /** How long (seconds) an in-flight order is re-read while the customer waits. */
     public const POLL_ATTEMPTS = 5;
 
+    /** How long (seconds) a charge of a saved method is re-read: it settles more slowly. */
+    public const SAVED_METHOD_POLL_ATTEMPTS = 15;
+
+    /** Payment states of a successful payment within an order. */
+    private const SUCCESSFUL_PAYMENT_STATES = ['authorisation_passed', 'authorised', 'capture_started', 'captured', 'completing', 'completed'];
+
+    /** saved_payment_method.type per gateway type. */
+    private const SAVED_METHOD_TYPES = [
+        GatewayType::CREDIT_CARD => 'card',
+    ];
+
     public $refundable = true;
 
-    public $token_billing = false;
+    public $token_billing = true;
 
     public $can_authorise_credit_card = false;
 
     public $payment_method;
 
     public static $methods = [
+        GatewayType::CREDIT_CARD => CreditCard::class,
         GatewayType::HOSTED_PAGE => Hosted::class,
     ];
 
@@ -85,6 +98,7 @@ class RevolutPaymentDriver extends BaseDriver
     public function gatewayTypes(): array
     {
         return [
+            GatewayType::CREDIT_CARD,
             GatewayType::HOSTED_PAGE,
         ];
     }
@@ -160,10 +174,273 @@ class RevolutPaymentDriver extends BaseDriver
     }
 
     /**
-     * The hosted checkout page does not save payment methods.
+     * Charge a saved payment method with no customer present (auto-bill): a
+     * merchant-initiated payment on a new order for the method's customer.
      */
     public function tokenBilling(ClientGatewayToken $cgt, PaymentHash $payment_hash)
     {
+        $this->setPaymentHash($payment_hash);
+
+        if ((int) $cgt->client_id !== (int) $this->client->id
+            || (int) $cgt->company_gateway_id !== (int) $this->company_gateway->id
+            || empty($cgt->gateway_customer_reference)) {
+            $this->failPayment('This saved payment method cannot be charged by this gateway.');
+        }
+
+        $order = $this->createOrder((int) $cgt->gateway_type_id, [
+            'customer' => ['id' => $cgt->gateway_customer_reference],
+        ]);
+
+        $this->chargeSavedMethod($order['id'], $cgt);
+
+        $order = $this->awaitOrder($this->api()->retrieveOrder($order['id']) ?? $order, self::SAVED_METHOD_POLL_ATTEMPTS);
+
+        $payment = $this->recordOrder($order);
+
+        if (! $payment) {
+            $this->failPayment(
+                $this->declineReason($order) ?? 'Payment not completed. Order state: ' . $this->orderState($order),
+                $order,
+            );
+        }
+
+        return $payment;
+    }
+
+    /**
+     * The client pays in the portal with a method they saved earlier. Like
+     * auto-billing it is a merchant-initiated charge of the saved method, so
+     * no 3DS step is needed. The page's order is moved to the method's
+     * Revolut customer and paid.
+     *
+     * @see https://developer.revolut.com/docs/api/merchant#pay-for-an-order
+     */
+    public function payWithSavedMethod(ClientGatewayToken $cgt, PaymentResponseRequest $request): RedirectResponse
+    {
+        $gateway_type_id = (int) $cgt->gateway_type_id;
+        $customer = ['customer' => ['id' => $cgt->gateway_customer_reference]];
+
+        // Reuse the order the page was mounted on; a new one only if it can no longer be paid.
+        $order = $this->reusableOrder($gateway_type_id);
+
+        if (! $order || ! $this->api()->updateOrder($order['id'], $customer)) {
+            $order = $this->createOrder($gateway_type_id, $customer);
+        }
+
+        $this->chargeSavedMethod($order['id'], $cgt);
+
+        return $this->completeCustomerPayment($request, $gateway_type_id, self::SAVED_METHOD_POLL_ATTEMPTS);
+    }
+
+    /**
+     * The payment page posted back: either the client chose a saved method
+     * (charged now), or the card field / Revolut Pay already paid the order.
+     */
+    public function completePortalPayment(PaymentResponseRequest $request, int $gateway_type_id): RedirectResponse
+    {
+        if (! $request->shouldUseToken()) {
+            return $this->completeCustomerPayment($request, $gateway_type_id);
+        }
+
+        $cgt = $this->savedPaymentMethod((string) $request->input('token'), $gateway_type_id);
+
+        if (! $cgt) {
+            $this->failPayment(ctrans('texts.payment_token_not_found'));
+        }
+
+        return $this->payWithSavedMethod($cgt, $request);
+    }
+
+    /**
+     * Pay an order with a saved method as a merchant-initiated payment.
+     * Stops the payment (mail, log, throw) when Revolut refuses it.
+     */
+    private function chargeSavedMethod(string $order_id, ClientGatewayToken $cgt): void
+    {
+        $response = $this->api()->payOrder($order_id, [
+            'type' => self::SAVED_METHOD_TYPES[(int) $cgt->gateway_type_id] ?? 'card',
+            'id' => $cgt->token,
+            'initiator' => 'merchant',
+        ]);
+
+        if (! $response?->successful()) {
+            $body = MerchantApi::body($response);
+
+            $this->failPayment(MerchantApi::errorMessage($body, 'Revolut declined the charge'), $body);
+        }
+    }
+
+    /**
+     * A saved method of this client on this gateway, from its hashed id.
+     */
+    public function savedPaymentMethod(?string $hashed_id, int $gateway_type_id): ?ClientGatewayToken
+    {
+        if (! $hashed_id) {
+            return null;
+        }
+
+        return ClientGatewayToken::query()
+            ->where('id', $this->decodePrimaryKey($hashed_id))
+            ->where('client_id', $this->client->id)
+            ->where('company_gateway_id', $this->company_gateway->id)
+            ->where('gateway_type_id', $gateway_type_id)
+            ->where('is_deleted', 0)
+            ->whereNotNull('gateway_customer_reference')
+            ->first();
+    }
+
+    /**
+     * A zero-amount order on the client's Revolut customer, used to save a
+     * card from the portal's "add payment method" page without charging it.
+     */
+    public function createSetupOrder(string $customer_id): array
+    {
+        $response = $this->api()->createOrder([
+            'amount' => 0,
+            'currency' => $this->client->getCurrencyCode(),
+            'capture_mode' => 'automatic',
+            'customer' => ['id' => $customer_id],
+            'description' => ctrans('texts.add_payment_method'),
+        ]);
+
+        $order = MerchantApi::body($response);
+
+        if (! $response?->successful() || empty($order['id']) || empty($order['token'])) {
+            $this->log(['message' => 'Could not create Revolut setup order', 'response' => $order], false);
+
+            throw new PaymentFailed(MerchantApi::errorMessage($order, 'Failed to create Revolut order'));
+        }
+
+        return $order;
+    }
+
+    /**
+     * Forget the saved method at Revolut when the client removes it.
+     */
+    public function detach(ClientGatewayToken $token)
+    {
+        if ($token->gateway_customer_reference && ! $this->api()->deleteSavedPaymentMethod($token->gateway_customer_reference, $token->token)) {
+            nlog('Revolut: could not delete saved payment method ' . $token->token);
+        }
+
+        return true;
+    }
+
+    /**
+     * Whether the merchant lets clients save payment methods on this gateway.
+     */
+    public function canSavePaymentMethods(): bool
+    {
+        return ($this->company_gateway->token_billing ?? 'off') !== 'off';
+    }
+
+    /**
+     * The Revolut customer that saved methods belong to: the one already on
+     * the client's saved methods, else a new one. Revolut needs the customer
+     * on the order for the payment method to be saved.
+     */
+    public function revolutCustomerId(): ?string
+    {
+        $customer_id = ClientGatewayToken::query()
+            ->where('client_id', $this->client->id)
+            ->where('company_gateway_id', $this->company_gateway->id)
+            ->whereNotNull('gateway_customer_reference')
+            ->value('gateway_customer_reference');
+
+        if ($customer_id) {
+            return $customer_id;
+        }
+
+        $contact = $this->getContact() ?: $this->client->primary_contact()->first() ?: $this->client->contacts()->first();
+
+        if (! $contact || ! $contact->email) {
+            return null;
+        }
+
+        return $this->api()->createCustomer(array_filter([
+            'full_name' => trim($contact->first_name . ' ' . $contact->last_name) ?: $this->client->present()->name(),
+            'email' => $contact->email,
+        ]));
+    }
+
+    /**
+     * Keep the payment method of the order's successful payment, once
+     * Revolut confirms it is saved on the customer for merchant use.
+     *
+     * Revolut saves a new payment method each time a card is entered, so a
+     * card the client already saved is recognised by its fingerprint: the
+     * existing saved card is kept and the duplicate is removed at Revolut.
+     */
+    public function storeSavedPaymentMethod(array $order, int $gateway_type_id): ?ClientGatewayToken
+    {
+        $customer_id = $order['customer']['id'] ?? null;
+        $method = $this->successfulPaymentMethod($order);
+
+        if (! $customer_id || empty($method['id'])) {
+            return null;
+        }
+
+        $saved = ClientGatewayToken::query()
+            ->where('client_id', $this->client->id)
+            ->where('company_gateway_id', $this->company_gateway->id)
+            ->where('gateway_type_id', $gateway_type_id)
+            ->where('is_deleted', 0)
+            ->get();
+
+        $existing = $saved->first(fn (ClientGatewayToken $cgt) => $cgt->token === $method['id']);
+
+        if ($existing) {
+            return $existing;
+        }
+
+        $fingerprint = $method['fingerprint'] ?? null;
+        $same_card = $fingerprint ? $saved->first(fn (ClientGatewayToken $cgt) => ($cgt->meta->fingerprint ?? null) === $fingerprint) : null;
+
+        if ($same_card) {
+            $this->api()->deleteSavedPaymentMethod($customer_id, $method['id']);
+
+            return $same_card;
+        }
+
+        $saved_for_merchant = collect($this->api()->savedPaymentMethods($customer_id))
+            ->contains(fn ($m) => ($m['id'] ?? null) === $method['id'] && strtolower((string) ($m['saved_for'] ?? '')) === 'merchant');
+
+        if (! $saved_for_merchant) {
+            return null;
+        }
+
+        return $this->storeGatewayToken([
+            'token' => $method['id'],
+            'payment_method_id' => $gateway_type_id,
+            'payment_meta' => $this->paymentMeta($method, $gateway_type_id),
+        ], ['gateway_customer_reference' => $customer_id]);
+    }
+
+    /**
+     * The payment method of the order's successful payment. A declined
+     * attempt can come first when the customer retried on the same order.
+     */
+    private function successfulPaymentMethod(array $order): ?array
+    {
+        $payment = collect($order['payments'] ?? [])
+            ->first(fn ($p) => in_array(strtolower((string) ($p['state'] ?? '')), self::SUCCESSFUL_PAYMENT_STATES, true));
+
+        return $payment['payment_method'] ?? null;
+    }
+
+    private function paymentMeta(array $method, int $gateway_type_id): \stdClass
+    {
+        $meta = new \stdClass();
+        $meta->type = $gateway_type_id;
+        $meta->brand = ucfirst(strtolower((string) ($method['card_brand'] ?? '')));
+        $meta->last4 = (string) ($method['card_last_four'] ?? '');
+
+        [$month, $year] = array_pad(explode('/', (string) ($method['card_expiry'] ?? '')), 2, '');
+        $meta->exp_month = $month;
+        $meta->exp_year = strlen($year) === 2 ? '20' . $year : $year;
+        $meta->fingerprint = $method['fingerprint'] ?? null;
+
+        return $meta;
     }
 
     /**
@@ -263,7 +540,18 @@ class RevolutPaymentDriver extends BaseDriver
      */
     public function pageOrder(int $gateway_type_id, array $extra = []): array
     {
-        return $this->reusableOrder($gateway_type_id) ?? $this->createOrder($gateway_type_id, $extra);
+        $order = $this->reusableOrder($gateway_type_id);
+
+        if ($order) {
+            return $order;
+        }
+
+        // Saving a method needs the Revolut customer on the order.
+        if ($gateway_type_id !== GatewayType::HOSTED_PAGE && $this->canSavePaymentMethods() && ($customer_id = $this->revolutCustomerId())) {
+            $extra['customer'] = ['id' => $customer_id];
+        }
+
+        return $this->createOrder($gateway_type_id, $extra);
     }
 
     /**
@@ -333,7 +621,8 @@ class RevolutPaymentDriver extends BaseDriver
 
     /**
      * The customer is back in the portal after paying: read the order back,
-     * record it and show the payment.
+     * record it, keep the payment method if the client chose to, and show the
+     * payment.
      */
     public function completeCustomerPayment(PaymentResponseRequest $request, int $gateway_type_id, int $attempts = self::POLL_ATTEMPTS): RedirectResponse
     {
@@ -358,6 +647,10 @@ class RevolutPaymentDriver extends BaseDriver
                 $this->declineReason($order) ?? 'Payment not completed. Order state: ' . $this->orderState($order),
                 $order,
             );
+        }
+
+        if ($request->shouldStoreToken() && $this->canSavePaymentMethods()) {
+            $this->storeSavedPaymentMethod($order, $gateway_type_id);
         }
 
         return redirect()->route('client.payments.show', ['payment' => $this->encodePrimaryKey($payment->id)]);
@@ -479,7 +772,17 @@ class RevolutPaymentDriver extends BaseDriver
     {
         return match ($gateway_type_id) {
             GatewayType::HOSTED_PAGE => PaymentType::HOSTED_PAGE,
-            default => PaymentType::CREDIT_CARD_OTHER,
+            default => match (strtolower((string) ($this->successfulPaymentMethod($order)['card_brand'] ?? ''))) {
+                'visa' => PaymentType::VISA,
+                'mastercard' => PaymentType::MASTERCARD,
+                'american_express', 'amex' => PaymentType::AMERICAN_EXPRESS,
+                'maestro' => PaymentType::MAESTRO,
+                'discover' => PaymentType::DISCOVER,
+                'diners', 'diners_club' => PaymentType::DINERS,
+                'jcb' => PaymentType::JCB,
+                'unionpay' => PaymentType::UNIONPAY,
+                default => PaymentType::CREDIT_CARD_OTHER,
+            },
         };
     }
 
