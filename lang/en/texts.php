@@ -6562,6 +6562,9 @@ $lang = array(
     'oidc_no_token' => 'No authentication token was returned. Please return to the login page and try again.',
     'back_to_login' => 'Back to login',
     'paid_in_full' => 'Paid in full',
+    'revolut_pay' => 'Revolut Pay',
+    'payment_type_Revolut Pay' => 'Revolut Pay',
+    'revolut_pay_another_account' => 'Another Revolut Pay account',
 
 );
 
